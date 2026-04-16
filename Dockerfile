@@ -1,76 +1,70 @@
 # ---- 第 1 阶段：安装依赖 ----
 FROM node:20-alpine AS deps
-
-# 启用 corepack 并激活 pnpm（Node20 默认提供 corepack）
 RUN corepack enable && corepack prepare pnpm@latest --activate
-
 WORKDIR /app
-
-# 仅复制依赖清单，提高构建缓存利用率
 COPY package.json pnpm-lock.yaml ./
-
-# 清理任何潜在的缓存并安装所有依赖（包括可选的原生模块）
 RUN pnpm store prune && pnpm install --frozen-lockfile
 
 # ---- 第 2 阶段：构建项目 ----
 FROM node:20-alpine AS builder
-# 安装构建工具以编译原生模块
 RUN apk add --no-cache python3 make g++
 RUN corepack enable && corepack prepare pnpm@latest --activate
 WORKDIR /app
-
-# 复制package files先，确保依赖版本一致
 COPY package.json pnpm-lock.yaml ./
-# 复制依赖
 COPY --from=deps /app/node_modules ./node_modules
-# 验证依赖完整性，如果不匹配则重新安装
 RUN pnpm install --frozen-lockfile --offline || pnpm install --frozen-lockfile
-# 复制全部源代码
 COPY . .
-
-# 在构建阶段设置 DOCKER_BUILD，启用 standalone 输出
 ENV DOCKER_BUILD=true
-
-# 生成生产构建
 RUN pnpm run build
 
 # ---- 第 3 阶段：生成运行时镜像 ----
 FROM node:20-alpine AS runner
 
-# 安装 CA 证书以支持 HTTPS 请求
-RUN apk add --no-cache ca-certificates \
-    && rm -rf /var/cache/apk/* \
-    && rm -rf /tmp/*
+# 1. 安装 CA 证书和下载 cloudflared 所需的工具
+RUN apk add --no-cache ca-certificates curl bash \
+    && rm -rf /var/cache/apk/*
 
-# 创建非 root 用户
+# 2. 下载并安装适合 Alpine (libc) 的 cloudflared 二进制文件
+# 注意：Alpine 需要特定的 musl 或链接良好的版本，官方提供的 linux-amd64 通常可以运行
+RUN curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared
+
 RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
 
 WORKDIR /app
 
-# 创建视频缓存目录并设置权限
 RUN mkdir -p /app/video-cache && chown -R nextjs:nodejs /app/video-cache
 ENV NODE_ENV=production
 ENV HOSTNAME=0.0.0.0
 ENV PORT=3000
 ENV DOCKER_BUILD=true
-# Puppeteer 配置：使用系统安装的 Chromium（已禁用）
-# ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-# ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
-# 从构建器中复制 standalone 输出
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-# 从构建器中复制 scripts 目录
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
-# 从构建器中复制 start.js
 COPY --from=builder --chown=nextjs:nodejs /app/start.js ./start.js
-# 从构建器中复制 public 和 .next/static 目录
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-# 切换到非特权用户
+# 3. 创建一个组合启动脚本
+# 我们需要同时启动 Node 和 Cloudflared。使用 bash 脚本来管理两个进程。
+RUN echo '#!/bin/bash\n\
+# 启动 Node.js 应用并放入后台\n\
+node start.js &\n\
+\n\
+# 启动 Cloudflare Tunnel\n\
+# CLOUDFLARE_TOKEN 需要在环境变量中设置\n\
+if [ -z "$CLOUDFLARE_TOKEN" ]; then\n\
+  echo "Error: CLOUDFLARE_TOKEN is not set."\n\
+  exit 1\n\
+fi\n\
+\n\
+echo "Starting Cloudflare Tunnel..."\n\
+cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TOKEN"\n\
+' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh && chown nextjs:nodejs /app/entrypoint.sh
+
 USER nextjs
 
 EXPOSE 3000
 
-# 使用自定义启动脚本，先预加载配置再启动服务器
-CMD ["node", "start.js"] 
+# 使用新的脚本启动
+CMD ["/app/entrypoint.sh"]
